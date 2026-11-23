@@ -1,0 +1,6 @@
+{
+  "name": "Trellas",
+  "description": "A calm, modern project and task management SaaS workspace for individuals and teams.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
