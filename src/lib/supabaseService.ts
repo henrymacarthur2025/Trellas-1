@@ -43,9 +43,34 @@ const ALLOWED_FILE_EXTS = new Set([
   '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
   '.png', '.jpg', '.jpeg', '.svg', '.webp', '.zip', '.txt', '.csv', '.md',
 ]);
+const EXT_MIME_MAP: Record<string, string> = {
+  '.pdf': 'application/pdf',
+  '.doc': 'application/msword',
+  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.xls': 'application/vnd.ms-excel',
+  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  '.ppt': 'application/vnd.ms-powerpoint',
+  '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.svg': 'image/svg+xml',
+  '.webp': 'image/webp',
+  '.zip': 'application/zip',
+  '.txt': 'text/plain',
+  '.csv': 'text/csv',
+  '.md': 'text/markdown',
+};
 const ALLOWED_AVATAR_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/svg+xml']);
 const MAX_FILE_BYTES = 10 * 1024 * 1024;
 const MAX_AVATAR_BYTES = 5 * 1024 * 1024;
+
+function resolveUploadMimeType(file: File, ext: string): string {
+  if (file.type && file.type !== 'application/octet-stream') {
+    return file.type;
+  }
+  return EXT_MIME_MAP[ext] || 'text/plain';
+}
 
 function requireClient() {
   if (!supabase || !isSupabaseConfigured) {
@@ -57,8 +82,25 @@ function requireClient() {
 function throwIfError(error: { message?: string; code?: string } | null, status = 400): void {
   if (!error) return;
   const code = error.code || '';
+  const msg = (error.message || '').trim();
   if (code === '42501') {
-    throw new SupabaseApiError('Permission denied by workspace access policy.', 403);
+    const lower = msg.toLowerCase();
+    if (lower.includes('permission denied for')) {
+      throw new SupabaseApiError(
+        `Database permission error (${msg}). Please run the complete supabase/schema.sql script in your Supabase SQL Editor.`,
+        403,
+      );
+    }
+    if (lower.includes('"users"') || lower.includes('"user_preferences"')) {
+      throw new SupabaseApiError(
+        `Permission denied on user profile policy (${msg}). Please ensure supabase/schema.sql RLS policies are applied.`,
+        403,
+      );
+    }
+    throw new SupabaseApiError(
+      msg ? `Permission denied by workspace access policy (${msg}).` : 'Permission denied by workspace access policy.',
+      403,
+    );
   }
   if (code === 'PGRST116') {
     throw new SupabaseApiError('Requested record was not found.', 404);
@@ -66,7 +108,7 @@ function throwIfError(error: { message?: string; code?: string } | null, status 
   if (code === '23505') {
     throw new SupabaseApiError('A matching record already exists.', 409);
   }
-  throw new SupabaseApiError(error.message || 'Database request failed', status);
+  throw new SupabaseApiError(msg || 'Database request failed', status);
 }
 
 function asIntBool(val: unknown): number {
@@ -175,7 +217,14 @@ export async function ensureSupabaseUserProfile(authUser: SupabaseAuthUser): Pro
   const uid = authUser.id;
   const now = new Date().toISOString();
 
-  let { data: uRow } = await client.from('users').select('*').eq('id', uid).maybeSingle();
+  const { data: existingUserRow, error: userSelectErr } = await client
+    .from('users')
+    .select('*')
+    .eq('id', uid)
+    .maybeSingle();
+  throwIfError(userSelectErr);
+  let uRow = existingUserRow;
+
   if (!uRow) {
     const fullName = String(authUser.user_metadata?.full_name || (authUser.email || '').split('@')[0] || 'Trellas User');
     const inserted = await client
@@ -203,10 +252,18 @@ export async function ensureSupabaseUserProfile(authUser: SupabaseAuthUser): Pro
       .eq('id', uid)
       .select('*')
       .single();
+    throwIfError(updated.error);
     if (updated.data) uRow = updated.data;
   }
 
-  let { data: pRow } = await client.from('user_preferences').select('*').eq('user_id', uid).maybeSingle();
+  const { data: existingPrefRow, error: prefSelectErr } = await client
+    .from('user_preferences')
+    .select('*')
+    .eq('user_id', uid)
+    .maybeSingle();
+  throwIfError(prefSelectErr);
+  let pRow = existingPrefRow;
+
   if (!pRow) {
     const insertedPref = await client
       .from('user_preferences')
@@ -246,13 +303,14 @@ export async function uploadUserAvatar(file: File): Promise<string> {
   if (file.size > MAX_AVATAR_BYTES) {
     throw new SupabaseApiError('Avatar image must be 5 MB or smaller.', 400);
   }
-  if (!ALLOWED_AVATAR_TYPES.has(file.type)) {
+  const ext = file.name.includes('.') ? `.${file.name.split('.').pop()?.toLowerCase()}` : '.png';
+  const resolvedType = resolveUploadMimeType(file, ext);
+  if (!ALLOWED_AVATAR_TYPES.has(resolvedType)) {
     throw new SupabaseApiError('Supported avatar formats: PNG, JPG, WebP, or SVG.', 400);
   }
-  const ext = file.name.includes('.') ? `.${file.name.split('.').pop()?.toLowerCase()}` : '.png';
   const objectPath = `${authUser.id}/${crypto.randomUUID()}${ext}`;
   const { error } = await client.storage.from(STORAGE_BUCKETS.AVATARS).upload(objectPath, file, {
-    contentType: file.type,
+    contentType: resolvedType,
     upsert: true,
   });
   if (error) {
@@ -874,16 +932,21 @@ export async function supabaseRequest<T = unknown>(rawUrl: string, options: Requ
   // ---------------------------------------------------------------------------
   if ((match = path.match(/^\/api\/workspaces\/([^/]+)\/members$/)) && method === 'GET') {
     const wsId = match[1];
-    const [wmRes, invRes, pmRes, tskRes] = await Promise.all([
+    const [wmRes, invRes, wsProjRes, tskRes] = await Promise.all([
       client.from('workspace_members').select('*').eq('workspace_id', wsId).order('joined_at', { ascending: true }),
       client.from('workspace_invitations').select('*').eq('workspace_id', wsId).eq('status', 'pending').order('created_at', { ascending: false }),
-      client.from('project_members').select('project_id, user_id'),
+      client.from('projects').select('id').eq('workspace_id', wsId).is('deleted_at', null),
       client.from('tasks').select('id, status, estimated_minutes, workspace_id').eq('workspace_id', wsId).is('deleted_at', null),
     ]);
     throwIfError(wmRes.error);
 
     const wmRows = (wmRes.data || []) as Array<Record<string, unknown>>;
     const invRows = (invRes.data || []) as Array<Record<string, unknown>>;
+    const wsProjIds = ((wsProjRes.data || []) as Array<{ id: string }>).map((p) => p.id);
+    const pmRes = wsProjIds.length > 0
+      ? await client.from('project_members').select('project_id, user_id').in('project_id', wsProjIds)
+      : { data: [] };
+
     const allUserIds = Array.from(
       new Set([...wmRows.map((m) => String(m.user_id)), ...invRows.map((i) => String(i.invited_by))]),
     );
@@ -897,15 +960,13 @@ export async function supabaseRequest<T = unknown>(rawUrl: string, options: Requ
     const wsTaskIds = wsTaskRows.map((t) => String(t.id));
     const taRes = wsTaskIds.length > 0 ? await client.from('task_assignees').select('task_id, user_id').in('task_id', wsTaskIds) : { data: [] };
     const taskMap = new Map(wsTaskRows.map((t) => [String(t.id), t]));
-
-    const wsProjRes = await client.from('projects').select('id').eq('workspace_id', wsId).is('deleted_at', null);
-    const wsProjIds = new Set(((wsProjRes.data || []) as Array<{ id: string }>).map((p) => p.id));
+    const wsProjIdSet = new Set(wsProjIds);
 
     const members: WorkspaceMember[] = wmRows.map((m) => {
       const uid = String(m.user_id);
       const u = userMap.get(uid) || {};
       const assignedProjCount = ((pmRes.data || []) as Array<Record<string, unknown>>).filter(
-        (pm) => String(pm.user_id) === uid && wsProjIds.has(String(pm.project_id)),
+        (pm) => String(pm.user_id) === uid && wsProjIdSet.has(String(pm.project_id)),
       ).length;
       const myTaskIds = ((taRes.data || []) as Array<Record<string, unknown>>)
         .filter((ta) => String(ta.user_id) === uid)
@@ -1111,7 +1172,7 @@ export async function supabaseRequest<T = unknown>(rawUrl: string, options: Requ
       client.from('boards').select('*').eq('project_id', prjId).limit(1).maybeSingle(),
       client.from('project_milestones').select('*').eq('project_id', prjId).order('due_date', { ascending: true }),
       client.from('project_discussions').select('*').eq('project_id', prjId).order('created_at', { ascending: false }),
-      getHydratedTasks(wsId, { projectId: prjId, includeArchived: true }),
+      getHydratedTasks(wsId, { projectId: prjId, includeArchived: Boolean(pRow.is_archived) }),
     ]);
 
     const project = hydratedList.find((p) => p.id === prjId) || (pRow as unknown as Project);
@@ -1216,7 +1277,8 @@ export async function supabaseRequest<T = unknown>(rawUrl: string, options: Requ
       const { error } = await client.from('projects').delete().eq('id', prjId);
       throwIfError(error);
     } else {
-      const { error } = await client.from('projects').update({ deleted_at: new Date().toISOString() }).eq('id', prjId);
+      const now = new Date().toISOString();
+      const { error } = await client.from('projects').update({ deleted_at: now, updated_at: now }).eq('id', prjId);
       throwIfError(error);
     }
     return { ok: true } as unknown as T;
@@ -1224,7 +1286,10 @@ export async function supabaseRequest<T = unknown>(rawUrl: string, options: Requ
 
   if ((match = path.match(/^\/api\/projects\/([^/]+)\/restore$/)) && method === 'POST') {
     const prjId = match[1];
-    const { error } = await client.from('projects').update({ deleted_at: null }).eq('id', prjId);
+    const { error } = await client
+      .from('projects')
+      .update({ deleted_at: null, is_archived: false, updated_at: new Date().toISOString() })
+      .eq('id', prjId);
     throwIfError(error);
     return { ok: true } as unknown as T;
   }
@@ -1395,10 +1460,12 @@ export async function supabaseRequest<T = unknown>(rawUrl: string, options: Requ
 
   if ((match = path.match(/^\/api\/boards\/([^/]+)\/columns\/reorder$/)) && method === 'POST') {
     const boardId = match[1];
-    const colIds = Array.isArray(body.columnIds) ? (body.columnIds as string[]) : [];
-    await Promise.all(
+    const rawIds = body.column_ids ?? body.columnIds;
+    const colIds = Array.isArray(rawIds) ? (rawIds as string[]) : [];
+    const results = await Promise.all(
       colIds.map((cid, idx) => client.from('board_columns').update({ position: idx }).eq('id', cid).eq('board_id', boardId)),
     );
+    for (const res of results) throwIfError(res.error);
     return { ok: true } as unknown as T;
   }
 
@@ -1529,27 +1596,58 @@ export async function supabaseRequest<T = unknown>(rawUrl: string, options: Requ
 
   if ((match = path.match(/^\/api\/workspaces\/([^/]+)\/tasks\/bulk$/)) && method === 'POST') {
     const wsId = match[1];
-    const taskIds = Array.isArray(body.taskIds) ? (body.taskIds as string[]) : [];
+    const { authUser } = await getCurrentSessionAndUser();
+    const rawTaskIds = body.task_ids ?? body.taskIds;
+    const taskIds = Array.isArray(rawTaskIds) ? (rawTaskIds as string[]) : [];
     const action = String(body.action || '');
-    const value = body.value !== undefined ? String(body.value) : '';
+    const value = body.value !== undefined && body.value !== null ? String(body.value) : '';
     if (taskIds.length === 0) return { ok: true } as unknown as T;
 
     const now = new Date().toISOString();
     if (action === 'delete') {
       const { error } = await client.from('tasks').update({ deleted_at: now, updated_at: now }).in('id', taskIds).eq('workspace_id', wsId);
       throwIfError(error);
+    } else if (action === 'archive') {
+      const { error } = await client.from('tasks').update({ is_archived: true, updated_at: now }).in('id', taskIds).eq('workspace_id', wsId);
+      throwIfError(error);
     } else if (action === 'priority') {
       const { error } = await client.from('tasks').update({ priority: value, updated_at: now }).in('id', taskIds).eq('workspace_id', wsId);
       throwIfError(error);
+    } else if (action === 'due_date') {
+      const { error } = await client.from('tasks').update({ due_date: value || null, updated_at: now }).in('id', taskIds).eq('workspace_id', wsId);
+      throwIfError(error);
+    } else if (action === 'assign' && value) {
+      const { data: targetTasks, error: tErr } = await client.from('tasks').select('id, title').in('id', taskIds).eq('workspace_id', wsId);
+      throwIfError(tErr);
+      const rows = (targetTasks || []) as Array<{ id: string; title: string }>;
+      if (rows.length > 0) {
+        const { error: aErr } = await client.from('task_assignees').upsert(
+          rows.map((t) => ({
+            id: crypto.randomUUID(),
+            task_id: t.id,
+            user_id: value,
+            is_primary: true,
+            assigned_at: now,
+          })),
+          { onConflict: 'task_id,user_id', ignoreDuplicates: true },
+        );
+        throwIfError(aErr);
+        await Promise.all(
+          rows.map((t) =>
+            sendNotification(wsId, value, authUser.id, 'assignment', 'Assigned to task', `You were assigned to "${t.title}"`, 'task', t.id),
+          ),
+        );
+      }
     } else if (action === 'status') {
-      const { data: targetTasks } = await client.from('tasks').select('id, board_id').in('id', taskIds).eq('workspace_id', wsId);
+      const { data: targetTasks, error: tErr } = await client.from('tasks').select('id, board_id').in('id', taskIds).eq('workspace_id', wsId);
+      throwIfError(tErr);
       const boardIds = Array.from(new Set(((targetTasks || []) as Array<{ board_id: string }>).map((t) => t.board_id)));
       const { data: cols } = boardIds.length > 0 ? await client.from('board_columns').select('id, board_id, status_key').in('board_id', boardIds) : { data: [] };
       const colByBoard = new Map<string, string>();
       for (const c of (cols || []) as Array<{ id: string; board_id: string; status_key: string }>) {
         if (c.status_key === value) colByBoard.set(c.board_id, c.id);
       }
-      await Promise.all(
+      const updates = await Promise.all(
         ((targetTasks || []) as Array<{ id: string; board_id: string }>).map((t) =>
           client
             .from('tasks')
@@ -1561,6 +1659,7 @@ export async function supabaseRequest<T = unknown>(rawUrl: string, options: Requ
             .eq('id', t.id),
         ),
       );
+      for (const res of updates) throwIfError(res.error);
     }
     return { ok: true } as unknown as T;
   }
@@ -1831,10 +1930,25 @@ export async function supabaseRequest<T = unknown>(rawUrl: string, options: Requ
       await logWorkspaceActivity(
         String(existing.workspace_id),
         authUser.id,
-        updates.status === 'completed' ? 'completed_task' : 'updated_task',
+        updates.status === 'completed' ? 'completed_task' : 'updated_status',
         `Moved "${existing.title}" to ${String(updates.status).replace('_', ' ')}`,
         String(existing.project_id),
         taskId,
+      );
+      const { data: curAssignees } = await client.from('task_assignees').select('user_id').eq('task_id', taskId);
+      await Promise.all(
+        ((curAssignees || []) as Array<{ user_id: string }>).map((a) =>
+          sendNotification(
+            String(existing.workspace_id),
+            a.user_id,
+            authUser.id,
+            'status',
+            'Task status updated',
+            `"${existing.title}" moved to ${String(updates.status).replace('_', ' ')}`,
+            'task',
+            taskId,
+          ),
+        ),
       );
     }
 
@@ -1847,7 +1961,8 @@ export async function supabaseRequest<T = unknown>(rawUrl: string, options: Requ
       const { error } = await client.from('tasks').delete().eq('id', taskId);
       throwIfError(error);
     } else {
-      const { error } = await client.from('tasks').update({ deleted_at: new Date().toISOString() }).eq('id', taskId);
+      const now = new Date().toISOString();
+      const { error } = await client.from('tasks').update({ deleted_at: now, updated_at: now }).eq('id', taskId);
       throwIfError(error);
     }
     return { ok: true } as unknown as T;
@@ -1855,7 +1970,10 @@ export async function supabaseRequest<T = unknown>(rawUrl: string, options: Requ
 
   if ((match = path.match(/^\/api\/tasks\/([^/]+)\/restore$/)) && method === 'POST') {
     const taskId = match[1];
-    const { error } = await client.from('tasks').update({ deleted_at: null }).eq('id', taskId);
+    const { error } = await client
+      .from('tasks')
+      .update({ deleted_at: null, is_archived: false, updated_at: new Date().toISOString() })
+      .eq('id', taskId);
     throwIfError(error);
     return { ok: true } as unknown as T;
   }
@@ -2124,9 +2242,10 @@ export async function supabaseRequest<T = unknown>(rawUrl: string, options: Requ
     const taskId = options.body.get('task_id') ? String(options.body.get('task_id')) : null;
     const safeExt = ext || '';
     const objectPath = `${wsId}/${crypto.randomUUID()}${safeExt}`;
+    const resolvedMimeType = resolveUploadMimeType(file, safeExt);
 
     const { error: upErr } = await client.storage.from(STORAGE_BUCKETS.FILES).upload(objectPath, file, {
-      contentType: file.type || 'application/octet-stream',
+      contentType: resolvedMimeType,
       upsert: false,
     });
     if (upErr) throw new SupabaseApiError(upErr.message || 'File upload failed.', 400);
@@ -2141,7 +2260,7 @@ export async function supabaseRequest<T = unknown>(rawUrl: string, options: Requ
       uploaded_by: authUser.id,
       original_name: file.name,
       stored_name: objectPath,
-      mime_type: file.type || 'application/octet-stream',
+      mime_type: resolvedMimeType,
       size_bytes: file.size,
       created_at: new Date().toISOString(),
     });
@@ -2244,11 +2363,18 @@ export async function supabaseRequest<T = unknown>(rawUrl: string, options: Requ
   if ((match = path.match(/^\/api\/time-entries\/([^/]+)$/)) && method === 'PATCH') {
     const updates: Record<string, unknown> = {};
     if (body.duration_seconds !== undefined) updates.duration_seconds = Number(body.duration_seconds);
+    if (body.description !== undefined) updates.description = String(body.description);
     if (body.is_running !== undefined) {
       updates.is_running = Boolean(body.is_running);
       if (!body.is_running) updates.ended_at = new Date().toISOString();
     }
     const { error } = await client.from('time_entries').update(updates).eq('id', match[1]);
+    throwIfError(error);
+    return { ok: true } as unknown as T;
+  }
+
+  if ((match = path.match(/^\/api\/time-entries\/([^/]+)$/)) && method === 'DELETE') {
+    const { error } = await client.from('time_entries').delete().eq('id', match[1]);
     throwIfError(error);
     return { ok: true } as unknown as T;
   }
@@ -2430,7 +2556,7 @@ export async function supabaseRequest<T = unknown>(rawUrl: string, options: Requ
 
   if ((match = path.match(/^\/api\/workspaces\/([^/]+)\/search$/)) && method === 'GET') {
     const wsId = match[1];
-    const q = (query.get('q') || '').trim();
+    const q = (query.get('q') || '').replace(/[(),]/g, ' ').trim();
     if (!q) return { projects: [], tasks: [], members: [], comments: [], files: [] } as unknown as T;
     const pat = `%${q}%`;
 

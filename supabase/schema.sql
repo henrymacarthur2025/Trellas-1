@@ -1,6 +1,9 @@
 -- =============================================================================
--- Trellas Workspace — Complete Supabase PostgreSQL Schema, RLS, Storage & Realtime
--- Run this script in the Supabase Dashboard -> SQL Editor on your project.
+-- Trellas Workspace — Complete Production Supabase PostgreSQL Schema
+-- Execute this entire script once in Supabase Dashboard -> SQL Editor.
+-- Covers: Core Tables, Constraints, Indexes, Auth & Timestamp Triggers,
+-- Non-Recursive RLS Helpers & Policies, Storage Buckets/Policies,
+-- System Project Templates Seed, and Realtime Publication.
 -- =============================================================================
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
@@ -134,7 +137,7 @@ CREATE TABLE IF NOT EXISTS public.board_columns (
   id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
   board_id TEXT NOT NULL REFERENCES public.boards(id) ON DELETE CASCADE,
   name TEXT NOT NULL,
-  position INTEGER NOT NULL DEFAULT 0,
+  position INTEGER NOT NULL DEFAULT 0 CHECK (position >= 0),
   color TEXT NOT NULL DEFAULT '#64748B',
   status_key TEXT NOT NULL DEFAULT 'todo' CHECK (status_key IN ('backlog', 'todo', 'in_progress', 'in_review', 'completed')),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -152,10 +155,10 @@ CREATE TABLE IF NOT EXISTS public.tasks (
   status TEXT NOT NULL DEFAULT 'todo' CHECK (status IN ('backlog', 'todo', 'in_progress', 'in_review', 'completed')),
   priority TEXT NOT NULL DEFAULT 'medium' CHECK (priority IN ('low', 'medium', 'high', 'urgent')),
   task_type TEXT NOT NULL DEFAULT 'task' CHECK (task_type IN ('task', 'bug', 'feature', 'milestone', 'story')),
-  position INTEGER NOT NULL DEFAULT 0,
+  position INTEGER NOT NULL DEFAULT 0 CHECK (position >= 0),
   start_date TEXT,
   due_date TEXT,
-  estimated_minutes INTEGER NOT NULL DEFAULT 0,
+  estimated_minutes INTEGER NOT NULL DEFAULT 0 CHECK (estimated_minutes >= 0),
   labels JSONB NOT NULL DEFAULT '[]'::jsonb,
   is_demo BOOLEAN NOT NULL DEFAULT FALSE,
   is_archived BOOLEAN NOT NULL DEFAULT FALSE,
@@ -181,7 +184,7 @@ CREATE TABLE IF NOT EXISTS public.subtasks (
   completed BOOLEAN NOT NULL DEFAULT FALSE,
   assignee_id TEXT REFERENCES public.users(id) ON DELETE SET NULL,
   due_date TEXT,
-  position INTEGER NOT NULL DEFAULT 0,
+  position INTEGER NOT NULL DEFAULT 0 CHECK (position >= 0),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -189,7 +192,7 @@ CREATE TABLE IF NOT EXISTS public.checklists (
   id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
   task_id TEXT NOT NULL REFERENCES public.tasks(id) ON DELETE CASCADE,
   title TEXT NOT NULL,
-  position INTEGER NOT NULL DEFAULT 0,
+  position INTEGER NOT NULL DEFAULT 0 CHECK (position >= 0),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -198,7 +201,7 @@ CREATE TABLE IF NOT EXISTS public.checklist_items (
   checklist_id TEXT NOT NULL REFERENCES public.checklists(id) ON DELETE CASCADE,
   text TEXT NOT NULL,
   completed BOOLEAN NOT NULL DEFAULT FALSE,
-  position INTEGER NOT NULL DEFAULT 0,
+  position INTEGER NOT NULL DEFAULT 0 CHECK (position >= 0),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -208,6 +211,7 @@ CREATE TABLE IF NOT EXISTS public.task_dependencies (
   related_task_id TEXT NOT NULL REFERENCES public.tasks(id) ON DELETE CASCADE,
   dependency_type TEXT NOT NULL DEFAULT 'related_to' CHECK (dependency_type IN ('blocking', 'blocked_by', 'related_to')),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CHECK (task_id <> related_task_id),
   UNIQUE (task_id, related_task_id, dependency_type)
 );
 
@@ -241,7 +245,7 @@ CREATE TABLE IF NOT EXISTS public.attachments (
   original_name TEXT NOT NULL,
   stored_name TEXT NOT NULL,
   mime_type TEXT NOT NULL,
-  size_bytes BIGINT NOT NULL,
+  size_bytes BIGINT NOT NULL CHECK (size_bytes >= 0),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -252,7 +256,7 @@ CREATE TABLE IF NOT EXISTS public.time_entries (
   task_id TEXT NOT NULL REFERENCES public.tasks(id) ON DELETE CASCADE,
   user_id TEXT NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
   description TEXT NOT NULL DEFAULT '',
-  duration_seconds INTEGER NOT NULL DEFAULT 0,
+  duration_seconds INTEGER NOT NULL DEFAULT 0 CHECK (duration_seconds >= 0),
   started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   ended_at TIMESTAMPTZ,
   is_running BOOLEAN NOT NULL DEFAULT FALSE,
@@ -264,7 +268,7 @@ CREATE TABLE IF NOT EXISTS public.notifications (
   workspace_id TEXT NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
   user_id TEXT NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
   actor_id TEXT REFERENCES public.users(id) ON DELETE SET NULL,
-  category TEXT NOT NULL,
+  category TEXT NOT NULL CHECK (category IN ('assignment', 'mention', 'comment', 'deadline', 'invitation', 'status', 'project')),
   title TEXT NOT NULL,
   message TEXT NOT NULL,
   link_type TEXT,
@@ -302,28 +306,93 @@ CREATE TABLE IF NOT EXISTS public.project_templates (
 -- 2. INDEXES
 -- -----------------------------------------------------------------------------
 
+CREATE INDEX IF NOT EXISTS idx_workspaces_owner ON public.workspaces(owner_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_workspaces_slug_active ON public.workspaces(slug) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_wm_workspace ON public.workspace_members(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_wm_user ON public.workspace_members(user_id);
 CREATE INDEX IF NOT EXISTS idx_winv_ws_email ON public.workspace_invitations(workspace_id, LOWER(email));
+CREATE INDEX IF NOT EXISTS idx_winv_status ON public.workspace_invitations(workspace_id, status);
 CREATE INDEX IF NOT EXISTS idx_projects_ws ON public.projects(workspace_id, deleted_at);
+CREATE INDEX IF NOT EXISTS idx_pm_project ON public.project_members(project_id);
+CREATE INDEX IF NOT EXISTS idx_pm_user ON public.project_members(user_id);
+CREATE INDEX IF NOT EXISTS idx_ms_project ON public.project_milestones(project_id, due_date);
+CREATE INDEX IF NOT EXISTS idx_disc_project ON public.project_discussions(project_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_boards_project ON public.boards(project_id);
 CREATE INDEX IF NOT EXISTS idx_board_cols_board ON public.board_columns(board_id, position);
 CREATE INDEX IF NOT EXISTS idx_tasks_ws ON public.tasks(workspace_id, deleted_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_project ON public.tasks(project_id, deleted_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_column ON public.tasks(column_id, position);
+CREATE INDEX IF NOT EXISTS idx_tasks_status ON public.tasks(workspace_id, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_due ON public.tasks(due_date);
+CREATE INDEX IF NOT EXISTS idx_task_assignees_task ON public.task_assignees(task_id);
 CREATE INDEX IF NOT EXISTS idx_task_assignees_user ON public.task_assignees(user_id);
 CREATE INDEX IF NOT EXISTS idx_subtasks_task ON public.subtasks(task_id, position);
 CREATE INDEX IF NOT EXISTS idx_checklists_task ON public.checklists(task_id, position);
-CREATE INDEX IF NOT EXISTS idx_comments_task ON public.comments(task_id);
+CREATE INDEX IF NOT EXISTS idx_ci_checklist ON public.checklist_items(checklist_id, position);
+CREATE INDEX IF NOT EXISTS idx_deps_task ON public.task_dependencies(task_id);
+CREATE INDEX IF NOT EXISTS idx_deps_related ON public.task_dependencies(related_task_id);
+CREATE INDEX IF NOT EXISTS idx_comments_task ON public.comments(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_cr_comment ON public.comment_reactions(comment_id);
+CREATE INDEX IF NOT EXISTS idx_att_ws ON public.attachments(workspace_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_att_project ON public.attachments(project_id);
+CREATE INDEX IF NOT EXISTS idx_att_task ON public.attachments(task_id);
+CREATE INDEX IF NOT EXISTS idx_att_comment ON public.attachments(comment_id);
+CREATE INDEX IF NOT EXISTS idx_te_ws ON public.time_entries(workspace_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_te_task ON public.time_entries(task_id, user_id);
 CREATE INDEX IF NOT EXISTS idx_notifications_user ON public.notifications(user_id, is_read);
+CREATE INDEX IF NOT EXISTS idx_notifications_ws_user ON public.notifications(workspace_id, user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_activity_ws ON public.activity_logs(workspace_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_time_entries_task ON public.time_entries(task_id, user_id);
-CREATE INDEX IF NOT EXISTS idx_attachments_ws ON public.attachments(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_activity_task ON public.activity_logs(task_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tpl_ws ON public.project_templates(workspace_id, is_system);
 
 -- -----------------------------------------------------------------------------
--- 3. AUTH TRIGGERS (Sync auth.users -> public.users & user_preferences)
+-- 3. TIMESTAMP MANAGEMENT & SUPABASE AUTH SYNC TRIGGERS
 -- -----------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION public.set_updated_at()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  NEW.updated_at := NOW();
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_users_updated_at ON public.users;
+CREATE TRIGGER trg_users_updated_at
+  BEFORE UPDATE ON public.users
+  FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+
+DROP TRIGGER IF EXISTS trg_user_preferences_updated_at ON public.user_preferences;
+CREATE TRIGGER trg_user_preferences_updated_at
+  BEFORE UPDATE ON public.user_preferences
+  FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+
+DROP TRIGGER IF EXISTS trg_workspaces_updated_at ON public.workspaces;
+CREATE TRIGGER trg_workspaces_updated_at
+  BEFORE UPDATE ON public.workspaces
+  FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+
+DROP TRIGGER IF EXISTS trg_projects_updated_at ON public.projects;
+CREATE TRIGGER trg_projects_updated_at
+  BEFORE UPDATE ON public.projects
+  FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+
+DROP TRIGGER IF EXISTS trg_project_discussions_updated_at ON public.project_discussions;
+CREATE TRIGGER trg_project_discussions_updated_at
+  BEFORE UPDATE ON public.project_discussions
+  FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+
+DROP TRIGGER IF EXISTS trg_tasks_updated_at ON public.tasks;
+CREATE TRIGGER trg_tasks_updated_at
+  BEFORE UPDATE ON public.tasks
+  FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+
+DROP TRIGGER IF EXISTS trg_comments_updated_at ON public.comments;
+CREATE TRIGGER trg_comments_updated_at
+  BEFORE UPDATE ON public.comments
+  FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
 
 CREATE OR REPLACE FUNCTION public.handle_new_auth_user()
 RETURNS TRIGGER
@@ -428,6 +497,23 @@ AS $$
   );
 $$;
 
+-- Used inside workspaces_update WITH CHECK so workspace soft-delete succeeds cleanly
+CREATE OR REPLACE FUNCTION public.has_workspace_role_raw(ws_id TEXT, allowed_roles TEXT[])
+RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.workspace_members wm
+    WHERE wm.workspace_id = ws_id
+      AND wm.user_id = auth.uid()::text
+      AND wm.role = ANY(allowed_roles)
+  );
+$$;
+
 CREATE OR REPLACE FUNCTION public.shares_workspace_with(target_user_id TEXT)
 RETURNS BOOLEAN
 LANGUAGE sql
@@ -439,8 +525,10 @@ AS $$
     SELECT 1
     FROM public.workspace_members wm_self
     JOIN public.workspace_members wm_other ON wm_other.workspace_id = wm_self.workspace_id
+    JOIN public.workspaces w ON w.id = wm_self.workspace_id
     WHERE wm_self.user_id = auth.uid()::text
       AND wm_other.user_id = target_user_id
+      AND w.deleted_at IS NULL
   );
 $$;
 
@@ -565,11 +653,18 @@ CREATE POLICY "workspaces_insert" ON public.workspaces FOR INSERT TO authenticat
 DROP POLICY IF EXISTS "workspaces_update" ON public.workspaces;
 CREATE POLICY "workspaces_update" ON public.workspaces FOR UPDATE TO authenticated
   USING (public.has_workspace_role(id, ARRAY['owner', 'admin']))
-  WITH CHECK (public.has_workspace_role(id, ARRAY['owner', 'admin']));
+  WITH CHECK (
+    public.has_workspace_role_raw(id, ARRAY['owner', 'admin'])
+    AND (
+      deleted_at IS NULL
+      OR owner_id = auth.uid()::text
+      OR public.has_workspace_role_raw(id, ARRAY['owner'])
+    )
+  );
 
 DROP POLICY IF EXISTS "workspaces_delete" ON public.workspaces;
 CREATE POLICY "workspaces_delete" ON public.workspaces FOR DELETE TO authenticated
-  USING (owner_id = auth.uid()::text);
+  USING (owner_id = auth.uid()::text OR public.has_workspace_role_raw(id, ARRAY['owner']));
 
 -- workspace_members
 DROP POLICY IF EXISTS "wm_select" ON public.workspace_members;
@@ -579,28 +674,39 @@ CREATE POLICY "wm_select" ON public.workspace_members FOR SELECT TO authenticate
 DROP POLICY IF EXISTS "wm_insert" ON public.workspace_members;
 CREATE POLICY "wm_insert" ON public.workspace_members FOR INSERT TO authenticated
   WITH CHECK (
-    public.has_workspace_role(workspace_id, ARRAY['owner', 'admin'])
+    public.has_workspace_role(workspace_members.workspace_id, ARRAY['owner', 'admin'])
     OR EXISTS (
       SELECT 1 FROM public.workspaces w
-      WHERE w.id = workspace_id AND w.owner_id = auth.uid()::text
+      WHERE w.id = workspace_members.workspace_id
+        AND w.owner_id = auth.uid()::text
+        AND w.deleted_at IS NULL
     )
-    OR EXISTS (
-      SELECT 1 FROM public.workspace_invitations inv
-      WHERE inv.workspace_id = workspace_id
-        AND inv.status = 'pending'
-        AND LOWER(inv.email) = LOWER(COALESCE(auth.jwt() ->> 'email', ''))
-        AND user_id = auth.uid()::text
+    OR (
+      workspace_members.user_id = auth.uid()::text
+      AND EXISTS (
+        SELECT 1 FROM public.workspace_invitations inv
+        WHERE inv.workspace_id = workspace_members.workspace_id
+          AND inv.status = 'pending'
+          AND inv.role = workspace_members.role
+          AND LOWER(inv.email) = LOWER(COALESCE(auth.jwt() ->> 'email', ''))
+      )
     )
   );
 
 DROP POLICY IF EXISTS "wm_update" ON public.workspace_members;
 CREATE POLICY "wm_update" ON public.workspace_members FOR UPDATE TO authenticated
-  USING (public.has_workspace_role(workspace_id, ARRAY['owner', 'admin']))
-  WITH CHECK (public.has_workspace_role(workspace_id, ARRAY['owner', 'admin']));
+  USING (public.has_workspace_role(workspace_id, ARRAY['owner', 'admin']) AND role <> 'owner')
+  WITH CHECK (
+    public.has_workspace_role(workspace_id, ARRAY['owner', 'admin'])
+    AND role <> 'owner'
+  );
 
 DROP POLICY IF EXISTS "wm_delete" ON public.workspace_members;
 CREATE POLICY "wm_delete" ON public.workspace_members FOR DELETE TO authenticated
-  USING (public.has_workspace_role(workspace_id, ARRAY['owner', 'admin']) OR user_id = auth.uid()::text);
+  USING (
+    role <> 'owner'
+    AND (public.has_workspace_role(workspace_id, ARRAY['owner', 'admin']) OR user_id = auth.uid()::text)
+  );
 
 -- workspace_invitations
 DROP POLICY IF EXISTS "winv_select" ON public.workspace_invitations;
@@ -619,25 +725,38 @@ CREATE POLICY "winv_update" ON public.workspace_invitations FOR UPDATE TO authen
   USING (
     public.has_workspace_role(workspace_id, ARRAY['owner', 'admin'])
     OR LOWER(email) = LOWER(COALESCE(auth.jwt() ->> 'email', ''))
+  )
+  WITH CHECK (
+    public.has_workspace_role(workspace_id, ARRAY['owner', 'admin'])
+    OR (
+      LOWER(email) = LOWER(COALESCE(auth.jwt() ->> 'email', ''))
+      AND status = 'accepted'
+    )
   );
 
 DROP POLICY IF EXISTS "winv_delete" ON public.workspace_invitations;
 CREATE POLICY "winv_delete" ON public.workspace_invitations FOR DELETE TO authenticated
   USING (public.has_workspace_role(workspace_id, ARRAY['owner', 'admin']));
 
--- projects
+-- projects (members can create, edit, pin, archive, restore; only owner/admin/project_manager can trash or permanently delete)
 DROP POLICY IF EXISTS "projects_select" ON public.projects;
 CREATE POLICY "projects_select" ON public.projects FOR SELECT TO authenticated
   USING (public.is_workspace_member(workspace_id));
 
 DROP POLICY IF EXISTS "projects_insert" ON public.projects;
 CREATE POLICY "projects_insert" ON public.projects FOR INSERT TO authenticated
-  WITH CHECK (public.has_workspace_role(workspace_id, ARRAY['owner', 'admin', 'project_manager']));
+  WITH CHECK (public.has_workspace_role(workspace_id, ARRAY['owner', 'admin', 'project_manager', 'member']));
 
 DROP POLICY IF EXISTS "projects_update" ON public.projects;
 CREATE POLICY "projects_update" ON public.projects FOR UPDATE TO authenticated
-  USING (public.has_workspace_role(workspace_id, ARRAY['owner', 'admin', 'project_manager']))
-  WITH CHECK (public.has_workspace_role(workspace_id, ARRAY['owner', 'admin', 'project_manager']));
+  USING (public.has_workspace_role(workspace_id, ARRAY['owner', 'admin', 'project_manager', 'member']))
+  WITH CHECK (
+    public.has_workspace_role(workspace_id, ARRAY['owner', 'admin', 'project_manager', 'member'])
+    AND (
+      deleted_at IS NULL
+      OR public.has_workspace_role(workspace_id, ARRAY['owner', 'admin', 'project_manager'])
+    )
+  );
 
 DROP POLICY IF EXISTS "projects_delete" ON public.projects;
 CREATE POLICY "projects_delete" ON public.projects FOR DELETE TO authenticated
@@ -650,8 +769,8 @@ CREATE POLICY "pm_select" ON public.project_members FOR SELECT TO authenticated
 
 DROP POLICY IF EXISTS "pm_write" ON public.project_members;
 CREATE POLICY "pm_write" ON public.project_members FOR ALL TO authenticated
-  USING (public.has_workspace_role(public.project_workspace_id(project_id), ARRAY['owner', 'admin', 'project_manager']))
-  WITH CHECK (public.has_workspace_role(public.project_workspace_id(project_id), ARRAY['owner', 'admin', 'project_manager']));
+  USING (public.has_workspace_role(public.project_workspace_id(project_id), ARRAY['owner', 'admin', 'project_manager', 'member']))
+  WITH CHECK (public.has_workspace_role(public.project_workspace_id(project_id), ARRAY['owner', 'admin', 'project_manager', 'member']));
 
 -- project_milestones
 DROP POLICY IF EXISTS "ms_select" ON public.project_milestones;
@@ -668,10 +787,30 @@ DROP POLICY IF EXISTS "disc_select" ON public.project_discussions;
 CREATE POLICY "disc_select" ON public.project_discussions FOR SELECT TO authenticated
   USING (public.is_workspace_member(public.project_workspace_id(project_id)));
 
-DROP POLICY IF EXISTS "disc_write" ON public.project_discussions;
-CREATE POLICY "disc_write" ON public.project_discussions FOR ALL TO authenticated
-  USING (public.has_workspace_role(public.project_workspace_id(project_id), ARRAY['owner', 'admin', 'project_manager', 'member']))
-  WITH CHECK (public.has_workspace_role(public.project_workspace_id(project_id), ARRAY['owner', 'admin', 'project_manager', 'member']));
+DROP POLICY IF EXISTS "disc_insert" ON public.project_discussions;
+CREATE POLICY "disc_insert" ON public.project_discussions FOR INSERT TO authenticated
+  WITH CHECK (
+    user_id = auth.uid()::text
+    AND public.has_workspace_role(public.project_workspace_id(project_id), ARRAY['owner', 'admin', 'project_manager', 'member'])
+  );
+
+DROP POLICY IF EXISTS "disc_update" ON public.project_discussions;
+CREATE POLICY "disc_update" ON public.project_discussions FOR UPDATE TO authenticated
+  USING (
+    user_id = auth.uid()::text
+    OR public.has_workspace_role(public.project_workspace_id(project_id), ARRAY['owner', 'admin'])
+  )
+  WITH CHECK (
+    user_id = auth.uid()::text
+    OR public.has_workspace_role(public.project_workspace_id(project_id), ARRAY['owner', 'admin'])
+  );
+
+DROP POLICY IF EXISTS "disc_delete" ON public.project_discussions;
+CREATE POLICY "disc_delete" ON public.project_discussions FOR DELETE TO authenticated
+  USING (
+    user_id = auth.uid()::text
+    OR public.has_workspace_role(public.project_workspace_id(project_id), ARRAY['owner', 'admin'])
+  );
 
 -- boards
 DROP POLICY IF EXISTS "boards_select" ON public.boards;
@@ -680,8 +819,8 @@ CREATE POLICY "boards_select" ON public.boards FOR SELECT TO authenticated
 
 DROP POLICY IF EXISTS "boards_write" ON public.boards;
 CREATE POLICY "boards_write" ON public.boards FOR ALL TO authenticated
-  USING (public.has_workspace_role(public.project_workspace_id(project_id), ARRAY['owner', 'admin', 'project_manager']))
-  WITH CHECK (public.has_workspace_role(public.project_workspace_id(project_id), ARRAY['owner', 'admin', 'project_manager']));
+  USING (public.has_workspace_role(public.project_workspace_id(project_id), ARRAY['owner', 'admin', 'project_manager', 'member']))
+  WITH CHECK (public.has_workspace_role(public.project_workspace_id(project_id), ARRAY['owner', 'admin', 'project_manager', 'member']));
 
 -- board_columns
 DROP POLICY IF EXISTS "cols_select" ON public.board_columns;
@@ -783,8 +922,14 @@ CREATE POLICY "cr_select" ON public.comment_reactions FOR SELECT TO authenticate
 
 DROP POLICY IF EXISTS "cr_write_own" ON public.comment_reactions;
 CREATE POLICY "cr_write_own" ON public.comment_reactions FOR ALL TO authenticated
-  USING (user_id = auth.uid()::text AND public.is_workspace_member(public.comment_workspace_id(comment_id)))
-  WITH CHECK (user_id = auth.uid()::text AND public.is_workspace_member(public.comment_workspace_id(comment_id)));
+  USING (
+    user_id = auth.uid()::text
+    AND public.has_workspace_role(public.comment_workspace_id(comment_id), ARRAY['owner', 'admin', 'project_manager', 'member'])
+  )
+  WITH CHECK (
+    user_id = auth.uid()::text
+    AND public.has_workspace_role(public.comment_workspace_id(comment_id), ARRAY['owner', 'admin', 'project_manager', 'member'])
+  );
 
 -- attachments
 DROP POLICY IF EXISTS "attachments_select" ON public.attachments;
@@ -824,7 +969,7 @@ CREATE POLICY "notif_select" ON public.notifications FOR SELECT TO authenticated
 
 DROP POLICY IF EXISTS "notif_insert" ON public.notifications;
 CREATE POLICY "notif_insert" ON public.notifications FOR INSERT TO authenticated
-  WITH CHECK (public.is_workspace_member(workspace_id));
+  WITH CHECK (public.has_workspace_role(workspace_id, ARRAY['owner', 'admin', 'project_manager', 'member']));
 
 DROP POLICY IF EXISTS "notif_update_own" ON public.notifications;
 CREATE POLICY "notif_update_own" ON public.notifications FOR UPDATE TO authenticated
@@ -850,8 +995,8 @@ CREATE POLICY "tpl_select" ON public.project_templates FOR SELECT TO authenticat
 
 DROP POLICY IF EXISTS "tpl_write" ON public.project_templates;
 CREATE POLICY "tpl_write" ON public.project_templates FOR ALL TO authenticated
-  USING (workspace_id IS NOT NULL AND public.has_workspace_role(workspace_id, ARRAY['owner', 'admin', 'project_manager', 'member']))
-  WITH CHECK (workspace_id IS NOT NULL AND public.has_workspace_role(workspace_id, ARRAY['owner', 'admin', 'project_manager', 'member']));
+  USING (is_system = FALSE AND workspace_id IS NOT NULL AND public.has_workspace_role(workspace_id, ARRAY['owner', 'admin', 'project_manager', 'member']))
+  WITH CHECK (is_system = FALSE AND workspace_id IS NOT NULL AND public.has_workspace_role(workspace_id, ARRAY['owner', 'admin', 'project_manager', 'member']));
 
 -- -----------------------------------------------------------------------------
 -- 6. SUPABASE STORAGE BUCKETS & POLICIES
@@ -883,8 +1028,9 @@ VALUES (
   ]
 )
 ON CONFLICT (id) DO UPDATE SET
-  public = FALSE,
-  file_size_limit = 10485760;
+  public = EXCLUDED.public,
+  file_size_limit = EXCLUDED.file_size_limit,
+  allowed_mime_types = EXCLUDED.allowed_mime_types;
 
 INSERT INTO storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
 VALUES (
@@ -895,8 +1041,9 @@ VALUES (
   ARRAY['image/png', 'image/jpeg', 'image/webp', 'image/svg+xml']
 )
 ON CONFLICT (id) DO UPDATE SET
-  public = TRUE,
-  file_size_limit = 5242880;
+  public = EXCLUDED.public,
+  file_size_limit = EXCLUDED.file_size_limit,
+  allowed_mime_types = EXCLUDED.allowed_mime_types;
 
 DROP POLICY IF EXISTS "trellas_files_select" ON storage.objects;
 CREATE POLICY "trellas_files_select" ON storage.objects FOR SELECT TO authenticated
@@ -912,6 +1059,10 @@ CREATE POLICY "trellas_files_insert" ON storage.objects FOR INSERT TO authentica
 DROP POLICY IF EXISTS "trellas_files_update" ON storage.objects;
 CREATE POLICY "trellas_files_update" ON storage.objects FOR UPDATE TO authenticated
   USING (
+    bucket_id = 'trellas-files'
+    AND public.has_workspace_role((storage.foldername(name))[1], ARRAY['owner', 'admin', 'project_manager', 'member'])
+  )
+  WITH CHECK (
     bucket_id = 'trellas-files'
     AND public.has_workspace_role((storage.foldername(name))[1], ARRAY['owner', 'admin', 'project_manager', 'member'])
   );
@@ -933,7 +1084,8 @@ CREATE POLICY "trellas_avatars_insert" ON storage.objects FOR INSERT TO authenti
 
 DROP POLICY IF EXISTS "trellas_avatars_update" ON storage.objects;
 CREATE POLICY "trellas_avatars_update" ON storage.objects FOR UPDATE TO authenticated
-  USING (bucket_id = 'trellas-avatars' AND (storage.foldername(name))[1] = auth.uid()::text);
+  USING (bucket_id = 'trellas-avatars' AND (storage.foldername(name))[1] = auth.uid()::text)
+  WITH CHECK (bucket_id = 'trellas-avatars' AND (storage.foldername(name))[1] = auth.uid()::text);
 
 DROP POLICY IF EXISTS "trellas_avatars_delete" ON storage.objects;
 CREATE POLICY "trellas_avatars_delete" ON storage.objects FOR DELETE TO authenticated
@@ -1004,7 +1156,7 @@ VALUES
 ON CONFLICT (id) DO NOTHING;
 
 -- -----------------------------------------------------------------------------
--- 8. REALTIME PUBLICATION
+-- 8. REALTIME REPLICA IDENTITY & PUBLICATION
 -- -----------------------------------------------------------------------------
 
 DO $$
@@ -1012,12 +1164,14 @@ DECLARE
   tbl TEXT;
   tbls TEXT[] := ARRAY[
     'projects',
+    'boards',
     'board_columns',
     'tasks',
     'task_assignees',
     'subtasks',
     'checklists',
     'checklist_items',
+    'task_dependencies',
     'comments',
     'comment_reactions',
     'attachments',
@@ -1031,6 +1185,7 @@ DECLARE
   ];
 BEGIN
   FOREACH tbl IN ARRAY tbls LOOP
+    EXECUTE format('ALTER TABLE public.%I REPLICA IDENTITY FULL', tbl);
     BEGIN
       EXECUTE format('ALTER PUBLICATION supabase_realtime ADD TABLE public.%I', tbl);
     EXCEPTION
@@ -1039,3 +1194,25 @@ BEGIN
     END;
   END LOOP;
 END $$;
+
+-- -----------------------------------------------------------------------------
+-- 9. SCHEMA, TABLE & RLS HELPER FUNCTION GRANTS
+-- -----------------------------------------------------------------------------
+
+GRANT USAGE ON SCHEMA public TO anon, authenticated, service_role;
+
+GRANT ALL ON ALL TABLES IN SCHEMA public TO postgres, service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
+
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO authenticated, service_role;
+
+GRANT EXECUTE ON FUNCTION public.is_workspace_member(TEXT) TO authenticated, service_role;
+GRANT EXECUTE ON FUNCTION public.has_workspace_role(TEXT, TEXT[]) TO authenticated, service_role;
+GRANT EXECUTE ON FUNCTION public.has_workspace_role_raw(TEXT, TEXT[]) TO authenticated, service_role;
+GRANT EXECUTE ON FUNCTION public.shares_workspace_with(TEXT) TO authenticated, service_role;
+GRANT EXECUTE ON FUNCTION public.project_workspace_id(TEXT) TO authenticated, service_role;
+GRANT EXECUTE ON FUNCTION public.board_workspace_id(TEXT) TO authenticated, service_role;
+GRANT EXECUTE ON FUNCTION public.task_workspace_id(TEXT) TO authenticated, service_role;
+GRANT EXECUTE ON FUNCTION public.checklist_workspace_id(TEXT) TO authenticated, service_role;
+GRANT EXECUTE ON FUNCTION public.comment_workspace_id(TEXT) TO authenticated, service_role;
+
